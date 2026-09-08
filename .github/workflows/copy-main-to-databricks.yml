@@ -1,0 +1,100 @@
+name: deploy-main-to-dbx
+
+on:
+  push:
+    branches: [ "main" ]      # corre al merge/push en main
+  workflow_dispatch: {}        # permite lanzarlo manualmente
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # === Config vía Secrets/Variables ===
+    # Secrets (Settings → Secrets and variables → Actions → Secrets):
+    #   - DATABRICKS_HOST (https://adb-xxxx.cloud.databricks.com)
+    #   - DATABRICKS_TOKEN (PAT con permisos de Workspace)
+    # Variables (opcionales):
+    #   - PROJ (ej: mi-proyecto)
+    #   - BASE_DIR (ej: /Shared/projects)
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      PROJ: ${{ vars.PROJ || 'tu-proyecto' }}
+      BASE_DIR: ${{ vars.BASE_DIR || '/Shared/projects' }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Instalar Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Verificar auth (debug)
+        run: |
+          set -e
+          [ -n "$DATABRICKS_HOST" ] || (echo "❌ Falta DATABRICKS_HOST" && exit 1)
+          [ -n "$DATABRICKS_TOKEN" ] || (echo "❌ Falta DATABRICKS_TOKEN" && exit 1)
+          echo "✔ Secrets presentes."
+          databricks --version
+          databricks current-user me || true
+          databricks workspace list / || true
+
+      - name: Resolver ruta destino
+        id: path
+        run: |
+          set -e
+          DEST="$BASE_DIR/$PROJ/prod"
+          echo "dir=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Destino: $DEST"
+
+      - name: Preparar destino (limpiar y crear)
+        run: |
+          set -e
+          databricks workspace delete --recursive "${{ steps.path.outputs.dir }}" || true
+          databricks workspace mkdirs "${{ steps.path.outputs.dir }}"
+
+      # ==== NUEVO: Staging sin dotfiles ====
+      - name: Instalar rsync (si falta) y preparar staging
+        run: |
+          set -e
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y rsync
+          fi
+          mkdir -p /tmp/ws_src
+          rsync -a ./ /tmp/ws_src \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='.gitattributes' \
+            --exclude='.vscode' \
+            --exclude='.idea' \
+            --exclude='__pycache__' \
+            --exclude='.DS_Store'
+
+      - name: Importar repo a Databricks (prod)
+        run: |
+          set -e
+          # Importa desde el staging (sin dotfiles) al Workspace
+          databricks workspace import-dir \
+            --overwrite \
+            /tmp/ws_src "${{ steps.path.outputs.dir }}"
+
+      - name: Listar contenido final
+        run: |
+          databricks workspace list "${{ steps.path.outputs.dir }}"
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Deploy a Databricks"
+            echo "- Destino: \`${{ steps.path.outputs.dir }}\`"
+            echo "- Proyecto: \`${PROJ}\`"
+            echo "- Base dir: \`${BASE_DIR}\`"
+          } >> $GITHUB_STEP_SUMMARY
