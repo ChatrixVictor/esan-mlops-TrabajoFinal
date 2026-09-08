@@ -1,0 +1,137 @@
+name: auto-pr-dev-to-main (debug)
+
+on:
+  push:
+    branches: ["dev", "DEV"]   # escucha dev y DEV
+  workflow_dispatch: {}
+
+# Repo Settings → Actions → Workflow permissions:
+#   - Read and write permissions
+#   - Allow GitHub Actions to create and approve pull requests
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  BASE_BRANCH: main            # rama destino
+  KEYWORD: TRABAJO_FINAL_MLOPS                  # palabra EXACTA requerida en algún commit
+  MIN_AHEAD: "1"               # dev debe estar >= MIN_AHEAD commits por delante de main
+  PR_TITLE_PREFIX: "Promote"   # prefijo del título del PR
+  PR_LABELS: "auto-pr,release" # etiquetas del PR (coma); vacío = ninguna
+  PR_REVIEWERS: ""             # reviewers (coma); vacío = ninguno
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Contexto básico
+        run: |
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_REF_NAME=$GITHUB_REF_NAME"
+          echo "Evento=$GITHUB_EVENT_NAME"
+
+      - name: Evaluar condiciones y recolectar debug
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            function escapeRegex(s){return (s||"").replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
+            const { owner, repo } = context.repo;
+            const base = process.env.BASE_BRANCH || "main";
+            const head = context.ref.replace("refs/heads/","");
+            const commits = context.payload.commits || [];
+            const msgs = commits.map(c => c.message || "");
+
+            // ✅ Palabra exacta con límites de palabra; sensible a mayúsculas
+            const regex = new RegExp(`\\b${escapeRegex(process.env.KEYWORD || "PR")}\\b`);
+            const hit = msgs.some(m => regex.test(m));
+
+            let aheadBy = -1, behindBy = -1, reason = "";
+            try {
+              const cmp = await github.rest.repos.compareCommits({ owner, repo, base, head });
+              aheadBy = cmp.data.ahead_by ?? -1;
+              behindBy = cmp.data.behind_by ?? -1;
+            } catch (e) {
+              reason = `compareCommits falló: ${e.message}`;
+            }
+
+            let existingUrl = "";
+            try {
+              const existing = await github.rest.pulls.list({ owner, repo, state: "open", base, head: `${owner}:${head}` });
+              if (existing.data.length > 0) existingUrl = existing.data[0].html_url;
+            } catch (e) { /* noop */ }
+
+            const minAhead = parseInt(process.env.MIN_AHEAD || "1", 10);
+            let open = true;
+            if (head.toLowerCase() === base.toLowerCase()) { open=false; reason="push en rama base"; }
+            else if (!hit) { open=false; reason=`no se encontró la palabra exacta "${process.env.KEYWORD}"`; }
+            else if (reason) { open=false; /* reason ya seteada */ }
+            else if (aheadBy < minAhead) { open=false; reason=`ahead_by=${aheadBy} < MIN_AHEAD=${minAhead}`; }
+            else if (existingUrl) { open=false; reason=`PR ya existe: ${existingUrl}`; }
+
+            core.info(`Base=${base} Head=${head}`);
+            core.info(`Mensajes: ${JSON.stringify(msgs)}`);
+            core.info(`Regex=${regex} hit=${hit} ahead_by=${aheadBy} behind_by=${behindBy}`);
+            if (reason) core.info(`Reason: ${reason}`);
+
+            core.setOutput("base", base);
+            core.setOutput("head", head);
+            core.setOutput("hit", String(hit));
+            core.setOutput("ahead_by", String(aheadBy));
+            core.setOutput("behind_by", String(behindBy));
+            core.setOutput("reason", reason);
+            core.setOutput("open", String(open));
+
+      - name: Crear PR (si procede)
+        if: steps.ctx.outputs.open == 'true'
+        uses: actions/github-script@v7
+        with:
+          # Si tu org bloquea creación de PRs con GITHUB_TOKEN,
+          # crea un PAT con scope repo como secreto GH_PAT y este fallback lo usará:
+          github-token: ${{ secrets.GH_PAT || github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const base = "${{ steps.ctx.outputs.base }}";
+            const head = "${{ steps.ctx.outputs.head }}";
+            const ahead = parseInt("${{ steps.ctx.outputs.ahead_by }}", 10);
+
+            const title = `${process.env.PR_TITLE_PREFIX || "Promote"} ${head} -> ${base} (${ahead} commit${ahead===1?"":"s"})`;
+            const body  = [
+              "PR automático generado por GitHub Actions.",
+              `- Base: \`${base}\``,
+              `- Head: \`${head}\``,
+              `- Commits por delante: **${ahead}**`,
+              "",
+              `Condición: presencia de la palabra exacta \`${process.env.KEYWORD}\` en un mensaje de commit.`
+            ].join("\n");
+
+            const pr = await github.rest.pulls.create({ owner, repo, base, head, title, body });
+            core.notice(`PR creado: ${pr.data.html_url}`);
+
+            // Etiquetas opcionales
+            const labels = (process.env.PR_LABELS || "").split(",").map(s=>s.trim()).filter(Boolean);
+            if (labels.length) {
+              try { await github.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels }); }
+              catch(e){ core.warning(`No se pudieron añadir labels: ${e.message}`); }
+            }
+
+            // Reviewers opcionales
+            const reviewers = (process.env.PR_REVIEWERS || "").split(",").map(s=>s.trim()).filter(Boolean);
+            if (reviewers.length) {
+              try { await github.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.data.number, reviewers }); }
+              catch(e){ core.warning(`No se pudieron asignar reviewers: ${e.message}`); }
+            }
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Auto PR debug"
+            echo "- Base: \`${{ steps.ctx.outputs.base }}\`"
+            echo "- Head: \`${{ steps.ctx.outputs.head }}\`"
+            echo "- Keyword encontrada: \`${{ steps.ctx.outputs.hit }}\` (KEYWORD=${KEYWORD})"
+            echo "- ahead_by: \`${{ steps.ctx.outputs.ahead_by }}\`"
+            echo "- behind_by: \`${{ steps.ctx.outputs.behind_by }}\`"
+            echo "- Abrir PR: \`${{ steps.ctx.outputs.open }}\`"
+            echo "- Motivo (si no abre): \`${{ steps.ctx.outputs.reason || '—' }}\`"
+          } >> $GITHUB_STEP_SUMMARY
