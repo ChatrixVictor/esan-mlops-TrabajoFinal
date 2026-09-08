@@ -22,7 +22,7 @@ jobs:
     env:
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-      PROJ: ${{ vars.PROJ || 'tu-proyecto' }}
+      PROJ: "Trabajo-final-MLOPS"
       BASE_DIR: ${{ vars.BASE_DIR || '/Shared/projects' }}
 
     steps:
